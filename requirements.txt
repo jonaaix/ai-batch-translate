@@ -1,0 +1,8 @@
+# For making HTTP requests to the AI API
+requests==2.31.0
+
+# For loading environment variables from a .env file
+python-dotenv==1.0.1
+
+# For colored logging output in the console
+colorlog==6.8.2
