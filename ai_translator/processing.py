@@ -9,23 +9,21 @@ from typing import Any, Dict, Optional, Tuple
 from tqdm import tqdm
 
 from ai_translator.services.ai_api import call_ai_translation_api
-from ai_translator.state_manager import finalize_file, read_progress, write_progress
+from ai_translator.state_manager import finalize_and_cleanup, read_progress, write_progress
 
 # Language priority for finding a source text
 SOURCE_LANG_PRIORITY = ["de", "en", "fr"]
 
 
 class FileProcessor:
-    """
-    Encapsulates all logic for processing a single translation source file.
-    """
+    """Encapsulates all logic for processing a single file located in the processing directory."""
 
-    def __init__(self, file_path: Path, args: argparse.Namespace, system_prompt: str):
-        self.file_path = file_path
+    def __init__(self, processing_path: Path, args: argparse.Namespace, system_prompt: str):
+        self.processing_path = processing_path
         self.args = args
         self.system_prompt = system_prompt
-        self.jsonl_path = file_path.with_suffix(".jsonl")
-        self.progress_path = file_path.with_suffix(".progress")
+        self.jsonl_path = self.processing_path.with_suffix(".jsonl")
+        self.progress_path = self.processing_path.with_suffix(".progress")
 
     @staticmethod
     def _is_language_key(key: str) -> bool:
@@ -53,15 +51,14 @@ class FileProcessor:
 
         source_info = self._get_source_language(item)
         if not source_info:
-            tqdm.write(f"[ERROR] Item #{item_index}: No valid source text found for this item.")
+            tqdm.write(f"[ERROR] Item #{item_index}: No valid source text found.")
             return item
 
         source_lang, source_text = source_info
 
-        # Log prompt example for the first item in a batch, using the passed-in index
         if (item_index - batch_start_index) % self.args.batch_size == 0:
             user_prompt_example = f"{source_text} /no_think"
-            logging.debug(f"Batch start prompt example for item #{item_index}: {user_prompt_example}")
+            logging.debug(f"Batch start prompt for item #{item_index}: {user_prompt_example}")
 
         translations = call_ai_translation_api(source_text, self.system_prompt, self.args.model)
 
@@ -76,24 +73,23 @@ class FileProcessor:
         return item
 
     def run(self) -> None:
-        """Orchestrates the processing of the file."""
-        logging.info(f"--- Starting processing for {self.file_path.name} ---")
+        """Orchestrates the processing of the file already in the processing directory."""
+        logging.info(f"--- Starting processing for {self.processing_path.name} ---")
 
         try:
-            with open(self.file_path, "r", encoding="utf-8") as f:
+            with open(self.processing_path, "r", encoding="utf-8") as f:
                 source_data = json.load(f)
         except (json.JSONDecodeError, IOError) as e:
-            logging.error(f"Could not read source file {self.file_path.name}: {e}")
+            logging.error(f"Could not read source file {self.processing_path.name}: {e}")
             return
 
         resume_index = read_progress(self.progress_path)
         if resume_index > 0:
-            logging.info(f"Resuming at source item #{resume_index} based on {self.progress_path.name}.")
+            logging.info(f"Resuming at item #{resume_index} from {self.progress_path.name}.")
 
         if resume_index >= len(source_data):
             logging.info("All source items evaluated. Finalizing.")
-            if finalize_file(self.file_path, self.jsonl_path, self.progress_path):
-                shutil.move(self.file_path, self.args.done_dir / self.file_path.name)
+            finalize_and_cleanup(self.processing_path, self.args.done_dir)
             return
 
         try:
@@ -101,7 +97,7 @@ class FileProcessor:
             with open(self.jsonl_path, write_mode, encoding="utf-8") as jsonl_file:
                 progress_bar = tqdm(
                     initial=resume_index, total=len(source_data),
-                    desc=f"Processing {self.file_path.name}", unit=" items"
+                    desc=f"Processing {self.processing_path.name}", unit=" items"
                 )
                 with progress_bar:
                     for i in range(resume_index, len(source_data)):
@@ -109,10 +105,9 @@ class FileProcessor:
                         progress_bar.set_postfix_str(f"Item #{i}")
 
                         available_langs = [k for k, v in item.items() if self._is_language_key(k) and v]
-                        if len(available_langs) <= 1:
+                        if len(available_langs) < 1:
                             tqdm.write(f"Item #{i} has <= 1 language. Skipping.")
                         else:
-                            # Pass the current loop index 'i' to the method
                             processed_item = self._translate_item(item, i, resume_index)
                             jsonl_file.write(json.dumps(processed_item) + "\n")
                             jsonl_file.flush()
@@ -121,11 +116,7 @@ class FileProcessor:
                         progress_bar.update(1)
 
         except IOError as e:
-            logging.error(f"A file operation failed: {e}")
+            logging.error(f"A file operation failed during processing: {e}")
             return
 
-        logging.info("All source items evaluated. Finalizing file.")
-        if finalize_file(self.file_path, self.jsonl_path, self.progress_path):
-            shutil.move(self.file_path, self.args.done_dir / self.file_path.name)
-        else:
-            logging.error(f"File {self.file_path.name} could not be finalized.")
+        finalize_and_cleanup(self.processing_path, self.args.done_dir)

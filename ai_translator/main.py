@@ -1,6 +1,8 @@
 # File: ai_translator/main.py
 import logging
+import shutil
 import sys
+from pathlib import Path
 
 from dotenv import load_dotenv
 
@@ -14,8 +16,10 @@ def run() -> None:
     setup_logging()
     args = parse_arguments()
 
-    args.done_dir.mkdir(exist_ok=True)
+    # Ensure all directories exist
     args.todo_dir.mkdir(exist_ok=True)
+    args.processing_dir.mkdir(exist_ok=True)
+    args.done_dir.mkdir(exist_ok=True)
 
     try:
         with open(args.prompt_file, "r", encoding="utf-8") as f:
@@ -24,22 +28,40 @@ def run() -> None:
         logging.critical(f"Could not read prompt file at {args.prompt_file}: {e}")
         sys.exit(1)
 
-    files_to_process = sorted(
+    # --- New Startup Logic ---
+
+    # 1. Prioritize any job already in the processing directory
+    processing_files = sorted(
+        [f for f in args.processing_dir.iterdir() if f.is_file() and f.suffix == ".json"]
+    )
+    if processing_files:
+        logging.info(f"Found {len(processing_files)} interrupted job(s). Resuming...")
+        for file_path in processing_files:
+            processor = FileProcessor(processing_path=file_path, args=args, system_prompt=system_prompt)
+            processor.run()
+    else:
+        logging.info("No interrupted jobs found in processing directory.")
+
+    # 2. Process new jobs from the todo directory
+    todo_files = sorted(
         [f for f in args.todo_dir.iterdir() if f.is_file() and f.suffix == ".json"]
     )
 
-    if not files_to_process:
-        logging.info("No JSON files found in the 'todo' directory.")
-        return
+    if not todo_files:
+        logging.info("No new files to process in 'todo' directory.")
+    else:
+        logging.info(f"Starting {len(todo_files)} new jobs from 'todo' directory.")
+        for source_path in todo_files:
+            processing_path = args.processing_dir / source_path.name
 
-    logging.info(f"Found {len(files_to_process)} files to process.")
+            try:
+                shutil.move(source_path, processing_path)
+                logging.info(f"Moved {source_path.name} to processing directory.")
+            except (IOError, OSError) as e:
+                logging.error(f"Could not move {source_path.name} to processing: {e}")
+                continue  # Skip to the next file
 
-    for file_path in files_to_process:
-        processor = FileProcessor(
-            file_path=file_path,
-            args=args,
-            system_prompt=system_prompt
-        )
-        processor.run()
+            processor = FileProcessor(processing_path=processing_path, args=args, system_prompt=system_prompt)
+            processor.run()
 
-    logging.info("All files processed.")
+    logging.info("All processing finished.")

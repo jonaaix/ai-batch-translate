@@ -27,15 +27,25 @@ def write_progress(progress_path: Path, index: int) -> None:
         logging.error(f"Could not write to progress file {progress_path.name}: {e}")
 
 
-def finalize_file(file_path: Path, jsonl_path: Path, progress_path: Path) -> bool:
-    """Creates the final JSON file from the .jsonl file and cleans up."""
-    logging.info(f"Finalizing {file_path.name} from {jsonl_path.name}.")
-    final_json_path = file_path.with_suffix(".json.final")
+def finalize_and_cleanup(
+        processing_path: Path,
+        done_dir: Path
+) -> bool:
+    """Creates the final JSON in 'done' dir and cleans up 'processing' dir."""
+    jsonl_path = processing_path.with_suffix(".jsonl")
+    progress_path = processing_path.with_suffix(".progress")
+    final_target_path = done_dir / processing_path.name
+
+    logging.info(f"Finalizing {processing_path.name} to {done_dir.name}.")
+
+    # Use a temporary file in the final destination for atomicity
+    temp_final_path = final_target_path.with_suffix(".json.final")
 
     processed_data = []
     try:
         if not jsonl_path.exists():
-            logging.warning(f"No .jsonl file found for {file_path.name}. Nothing to finalize.")
+            logging.warning(f"No .jsonl data found for {processing_path.name}. Moving original file to done.")
+            shutil.move(processing_path, final_target_path)
             if progress_path.exists(): progress_path.unlink()
             return True
 
@@ -43,23 +53,22 @@ def finalize_file(file_path: Path, jsonl_path: Path, progress_path: Path) -> boo
             for line in f:
                 processed_data.append(json.loads(line))
 
-        with open(final_json_path, "w", encoding="utf-8") as f:
+        with open(temp_final_path, "w", encoding="utf-8") as f:
             json.dump(processed_data, f, indent=2, ensure_ascii=False)
 
-        with open(final_json_path, "r", encoding="utf-8") as f:
-            json.load(f)
-        logging.info(f"Validation successful for {final_json_path.name}.")
+        # Atomically move the final file into place
+        shutil.move(temp_final_path, final_target_path)
+        logging.info(f"Successfully created final file: {final_target_path.name}")
 
-        shutil.move(final_json_path, file_path)
-        logging.info(f"Successfully created final file: {file_path.name}")
-
+        # Cleanup all files in the processing directory
         jsonl_path.unlink()
         progress_path.unlink()
+        processing_path.unlink()  # Delete the original moved source file
         return True
 
     except (IOError, json.JSONDecodeError, OSError) as e:
-        logging.critical(f"CRITICAL: Failed to finalize {file_path.name}. Error: {e}")
-        logging.critical(f"Progress is saved in {jsonl_path.name}. Manual recovery needed.")
-        if final_json_path.exists():
-            final_json_path.unlink()
+        logging.critical(f"CRITICAL: Failed to finalize. Error: {e}")
+        logging.critical(f"Working files are preserved in {processing_path.parent}.")
+        if temp_final_path.exists():
+            temp_final_path.unlink()
         return False
