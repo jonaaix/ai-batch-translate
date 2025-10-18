@@ -1,4 +1,14 @@
-data/**/*
+# Ignore everything in data
+data/**
+
+# But keep these directories (so their .gitkeep files can exist)
+!data/
+!data/todo/
+!data/done/
+
+# Keep only the .gitkeep files inside
+!data/todo/.gitkeep
+!data/done/.gitkeep
 
 # Environment variables
 .env

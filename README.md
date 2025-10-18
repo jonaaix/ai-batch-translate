@@ -4,6 +4,10 @@ A script to batch-translate JSON files using a local AI API.
 
 ---
 
+## Prepare Data
+- Use the queries in `queries/eBusiness-export.sql` to create the export JSON files with all texts.
+- Then place the JSON files into the `data/todo/` directory.
+
 ## Setup
 
 1.  **Create & Activate Virtual Environment**
