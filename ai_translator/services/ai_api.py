@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import re
+import time
 from typing import Dict, Optional
 
 import requests
@@ -49,8 +50,10 @@ def call_ai_translation_api(
     }
 
     response_text = ""
+    start_time = time.monotonic()
     try:
         response = requests.post(api_url, headers=headers, json=payload, timeout=180)
+        duration = time.monotonic() - start_time
         response_text = response.text
         response.raise_for_status()
 
@@ -61,11 +64,14 @@ def call_ai_translation_api(
         pretty_json = json.dumps(translations, indent=2, ensure_ascii=False)
         logging.debug(f"Successfully parsed AI response:\n{pretty_json}")
 
+        logging.info(f"API request succeeded in {duration:.2f} seconds.")
         return translations
 
     except requests.exceptions.RequestException as e:
-        logging.error(f"API request failed: {e}")
+        duration = time.monotonic() - start_time
+        logging.error(f"API request failed after {duration:.2f} seconds: {e}")
     except (KeyError, IndexError, json.JSONDecodeError, ValueError, TypeError) as e:
-        logging.error(f"Failed to parse API response: {e}. Raw content: {response_text}")
+        duration = time.monotonic() - start_time
+        logging.error(f"Failed to parse API response after {duration:.2f}s: {e}. Raw: {response_text}")
 
     return None
