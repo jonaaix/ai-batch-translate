@@ -10,24 +10,20 @@ from colorlog import ColoredFormatter
 # --- Constants ---
 DEFAULT_BATCH_SIZE: int = 100
 DEFAULT_API_DELAY_S: float = 0.0
+DEFAULT_WORKERS: int = 8
 
 
 def setup_logging(log_file: str = "processing.log") -> None:
-    """Configure logging to file (standard) and console (colored)."""
+    # ... (function remains unchanged)
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.DEBUG)
-
     if root_logger.hasHandlers():
         root_logger.handlers.clear()
-
-    # File handler
     file_formatter = logging.Formatter("%(asctime)s [%(levelname)s] - %(message)s")
     file_handler = logging.FileHandler(log_file)
     file_handler.setLevel(logging.INFO)
     file_handler.setFormatter(file_formatter)
     root_logger.addHandler(file_handler)
-
-    # Console handler
     log_colors = {
         'DEBUG': 'white', 'INFO': 'green', 'WARNING': 'yellow',
         'ERROR': 'red', 'CRITICAL': 'bold_red',
@@ -46,6 +42,16 @@ def parse_arguments() -> argparse.Namespace:
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(description="Batch translate JSON files.")
     parser.add_argument(
+        "--workers", type=int, default=DEFAULT_WORKERS,
+        help="Number of parallel requests. Overridden by --auto-tune."
+    )
+    # The auto-tune feature is now enabled by default.
+    parser.add_argument(
+        "--no-auto-tune", dest='auto_tune', action='store_false',
+        help="Disable the default auto-tuning of worker count."
+    )
+    # ... (rest of arguments are unchanged)
+    parser.add_argument(
         "--todo-dir", type=Path, default=Path("data/todo"),
         help="Directory with files to process."
     )
@@ -61,7 +67,6 @@ def parse_arguments() -> argparse.Namespace:
         "--prompt-file", type=Path, default=Path("prompts/system/translator.md"),
         help="Path to the system prompt file."
     )
-    # ... (rest of arguments are unchanged)
     parser.add_argument(
         "--batch-size", type=int, default=DEFAULT_BATCH_SIZE,
         help="Items to process before a checkpoint."
