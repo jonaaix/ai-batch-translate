@@ -46,3 +46,18 @@ A script to batch-translate JSON files using a local AI API.
     ```
 
 3.  **Find** completed files in the `data/done/` directory. Check `processing.log` for details.
+
+## RunPod setup oneliner
+```shell
+python -m venv venv && source venv/bin/activate && pip install -r requirements.txt
+
+pkill -f ollama && \
+OLLAMA_HOST=0.0.0.0 \
+OLLAMA_KEEP_ALIVE=24h \
+OLLAMA_NUM_PARALLEL=2 \
+OLLAMA_MAX_LOADED_MODELS=1 \
+OLLAMA_FLASH_ATTENTION=0 \
+ollama serve &
+
+python run_translator.py --no-auto-tune --workers 16
+```
