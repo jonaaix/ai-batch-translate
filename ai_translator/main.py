@@ -5,7 +5,7 @@ import sys
 from dotenv import load_dotenv
 
 from ai_translator.config import parse_arguments, setup_logging
-from ai_translator.processing import process_file
+from ai_translator.processing import FileProcessor
 
 
 def run() -> None:
@@ -24,8 +24,9 @@ def run() -> None:
         logging.critical(f"Could not read prompt file at {args.prompt_file}: {e}")
         sys.exit(1)
 
-    files_to_process = [f for f in args.todo_dir.iterdir() if f.is_file() and f.suffix == ".json"]
-    files_to_process.sort()
+    files_to_process = sorted(
+        [f for f in args.todo_dir.iterdir() if f.is_file() and f.suffix == ".json"]
+    )
 
     if not files_to_process:
         logging.info("No JSON files found in the 'todo' directory.")
@@ -34,6 +35,11 @@ def run() -> None:
     logging.info(f"Found {len(files_to_process)} files to process.")
 
     for file_path in files_to_process:
-        process_file(file_path, args, system_prompt)
+        processor = FileProcessor(
+            file_path=file_path,
+            args=args,
+            system_prompt=system_prompt
+        )
+        processor.run()
 
     logging.info("All files processed.")
