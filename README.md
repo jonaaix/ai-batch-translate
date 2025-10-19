@@ -7,6 +7,7 @@ A script to batch-translate JSON files using a local AI API.
 ## Prepare Data
 - Use the queries in `queries/export.sql` to create the export JSON files with all texts.
 - Then place the JSON files into the `data/todo/` directory.
+- **Important:** If you extracted JSON columns, use the `double_json_converter` script to create proper JSON files. Otherwise, the LLM creates a high error rate.
 
 ## Setup
 
