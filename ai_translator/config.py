@@ -42,8 +42,8 @@ def parse_arguments() -> argparse.Namespace:
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(description="Batch translate JSON files.")
     parser.add_argument(
-        "--workers", type=int, default=DEFAULT_WORKERS,
-        help="Number of parallel requests. Overridden by --auto-tune."
+        "--workers", type=int, default=4,
+        help="Number of parallel worker threads."
     )
     # The auto-tune feature is now enabled by default.
     parser.add_argument(

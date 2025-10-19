@@ -11,12 +11,13 @@ from tqdm import tqdm
 
 from ai_translator.services.ai_api import call_ai_translation_api
 from ai_translator.state_manager import finalize_and_cleanup, read_progress, write_progress
-from ai_translator.tuner import WorkerTuner
-from ai_translator.utils import get_source_language, is_language_key
+
+# Language priority for finding a source text
+SOURCE_LANG_PRIORITY = ["de", "en", "fr"]
 
 
 class FileProcessor:
-    """Orchestrates the processing of a single translation source file."""
+    """Encapsulates all logic for processing a single file located in the processing directory."""
 
     def __init__(self, processing_path: Path, args: argparse.Namespace, system_prompt: str):
         self.processing_path = processing_path
@@ -25,28 +26,41 @@ class FileProcessor:
         self.jsonl_path = self.processing_path.with_suffix(".jsonl")
         self.progress_path = self.processing_path.with_suffix(".progress")
 
-    def _process_single_item(self, item_tuple: Tuple[int, Dict[str, Any]]) -> Tuple[int, Optional[Dict[str, Any]]]:
-        """Handles the logic for a single item: filtering, translation, and returning the result."""
+    @staticmethod
+    def _is_language_key(key: str) -> bool:
+        """Check if a key is a 2-letter language code."""
+        return len(key) == 2
 
-        item_index, item = item_tuple
+    def _get_source_language(self, item: Dict[str, Any]) -> Optional[Tuple[str, str]]:
+        """Finds the best available source language based on priority."""
+        for lang in SOURCE_LANG_PRIORITY:
+            if item.get(lang) and self._is_language_key(lang):
+                return lang, item[lang]
+        for lang, text in item.items():
+            if self._is_language_key(lang) and text:
+                return lang, text
+        return None
 
-        available_langs = [k for k, v in item.items() if is_language_key(k) and v]
-        if len(available_langs) <= 1:
-            tqdm.write(f"Item #{item_index} has <= 1 valid language (Found: {available_langs}). Skipping.")
-            return item_index, None  # None indicates the item should be skipped
-
-        lang_values = {k: v for k, v in item.items() if is_language_key(k)}
+    def _translate_item(self, item: Dict[str, Any], item_index: int, batch_start_index: int) -> Dict[str, Any]:
+        """Handles the translation logic for a single item."""
+        lang_values = {k: v for k, v in item.items() if self._is_language_key(k)}
         missing = [k for k, v in lang_values.items() if not v]
+
         if not missing:
             tqdm.write(f"Item #{item_index} is already fully translated.")
-            return item_index, item
+            return item
 
-        source_info = get_source_language(item)
+        source_info = self._get_source_language(item)
         if not source_info:
             tqdm.write(f"[ERROR] Item #{item_index}: No valid source text found.")
-            return item_index, item
+            return item
 
         source_lang, source_text = source_info
+
+        if (item_index - batch_start_index) % self.args.batch_size == 0:
+            user_prompt_example = f"{source_text} /no_think"
+            logging.debug(f"Batch start prompt for item #{item_index}: {user_prompt_example}")
+
         translations = call_ai_translation_api(source_text, self.system_prompt, self.args.model)
 
         if translations:
@@ -57,11 +71,40 @@ class FileProcessor:
         else:
             tqdm.write(f"[ERROR] Translation failed for item #{item_index}.")
 
-        return item_index, item
+        return item
+
+    def _process_item_wrapper(
+        self,
+        item_index: int,
+        item: Dict[str, Any],
+        batch_start_index: int
+    ) -> Tuple[int, Optional[Dict[str, Any]]]:
+        """
+        Wraps the logic from the old single-threaded loop for use in a thread pool.
+        Returns the original index and the processed item, or None if skipped.
+        """
+        try:
+            # This logic is from your working snapshot's run() loop
+            available_langs = [k for k, v in item.items() if self._is_language_key(k) and v]
+            if len(available_langs) < 1:
+                tqdm.write(f"Item #{item_index} has 0 languages. Skipping.")
+                return item_index, None  # None indicates "skip"
+
+            # This logic calls your working snapshot's translate function
+            processed_item = self._translate_item(item, item_index, batch_start_index)
+            return item_index, processed_item
+
+        except Exception as e:
+            # Catch errors within the thread to avoid killing the whole pool
+            tqdm.write(f"[CRITICAL_THREAD_ERROR] Item #{item_index} failed: {e}")
+            logging.error(f"Error processing item #{item_index}: {e}", exc_info=True)
+            # Return original item on failure, so progress can advance
+            return item_index, item
 
     def run(self) -> None:
-        """Main execution method for processing the file."""
+        """Orchestrates the processing of the file already in the processing directory."""
         logging.info(f"--- Starting processing for {self.processing_path.name} ---")
+
         try:
             with open(self.processing_path, "r", encoding="utf-8") as f:
                 source_data = json.load(f)
@@ -70,31 +113,31 @@ class FileProcessor:
             return
 
         resume_index = read_progress(self.progress_path)
-        items_to_process = list(enumerate(source_data))[resume_index:]
+        if resume_index > 0:
+            logging.info(f"Resuming at item #{resume_index} from {self.progress_path.name}.")
 
-        if not items_to_process and resume_index > 0:
-            logging.info("All source items were already processed. Finalizing.")
-            # If we are resuming and have no items, we are done.
-            finalize_and_cleanup(self.processing_path, self.args.done_dir)
-            return
-        elif not items_to_process:
-            logging.info("Source file is empty. Moving to done.")
-            # Source file was empty to begin with
+        if resume_index >= len(source_data):
+            logging.info("All source items evaluated. Finalizing.")
             finalize_and_cleanup(self.processing_path, self.args.done_dir)
             return
 
-        num_workers = self.args.workers
-        if self.args.auto_tune and len(items_to_process) > 40:  # Need enough items to tune
-            tuner = WorkerTuner(self)
-            num_workers = tuner.auto_tune(items_to_process)
-        else:
-            logging.info(f"Using fixed number of workers: {num_workers}")
-            self.args.num_workers = num_workers
+        # --- NEW THREADED LOGIC ---
 
-        # --- NEW LOGIC: Immediate append with in-order buffer ---
+        # 1. Prepare items to process (from the resume_index onwards)
+        items_to_process = []
+        for i in range(resume_index, len(source_data)):
+            items_to_process.append((i, source_data[i]))  # Tuple: (original_index, item_data)
+
+        if not items_to_process:
+            logging.info("No items left to process.")
+            finalize_and_cleanup(self.processing_path, self.args.done_dir)
+            return
+
+        # Get worker count from args (added to config.py)
+        num_workers = getattr(self.args, "workers", 1)  # Default to 1 if arg is missing
+        logging.info(f"Starting job with {num_workers} worker threads.")
 
         # This is the next sequential index we must write to the file.
-        # It's initialized to the index we are resuming from.
         next_index_to_write = resume_index
 
         # Buffer for results that finish out of order
@@ -108,22 +151,26 @@ class FileProcessor:
                 with ThreadPoolExecutor(max_workers=num_workers) as executor:
 
                     futures = {
-                        executor.submit(self._process_single_item, item): item[0]
-                        for item in items_to_process
+                        executor.submit(self._process_item_wrapper, i, item, resume_index): i
+                        for (i, item) in items_to_process
                     }
 
-                    progress_bar = tqdm(total=len(items_to_process), desc=f"Processing {self.processing_path.name}",
-                                        unit=" items")
+                    progress_bar = tqdm(
+                        initial=0,  # This bar tracks *completed* items
+                        total=len(items_to_process),
+                        desc=f"Processing {self.processing_path.name}",
+                        unit=" items"
+                    )
 
                     with progress_bar:
                         for future in as_completed(futures):
                             # 1. A thread finished (out of order)
-                            original_index, result_item = future.result()
-                            results_buffer[original_index] = result_item
+                            original_index, processed_item = future.result()
+
+                            results_buffer[original_index] = processed_item
                             progress_bar.update(1)
 
                             # 2. Try to flush the buffer *in order*
-                            # Check if the index we are waiting for is now in the buffer
                             while next_index_to_write in results_buffer:
                                 # Get the item for the *correct* index
                                 buffered_item = results_buffer.pop(next_index_to_write)
@@ -132,13 +179,16 @@ class FileProcessor:
                                 if buffered_item:
                                     jsonl_file.write(json.dumps(buffered_item, ensure_ascii=False) + "\n")
 
+                                # --- FIX: Force flush to disk immediately ---
+                                jsonl_file.flush()
+
                                 # B) Update progress file to point to the *next* item
                                 write_progress(self.progress_path, next_index_to_write + 1)
 
                                 # C) Increment the pointer
                                 next_index_to_write += 1
 
-                        # Flush the file buffer to disk
+                        # Final flush in case the loop finishes but buffer logic didn't
                         jsonl_file.flush()
 
                         # 3. Check if we finished the whole file
@@ -148,12 +198,8 @@ class FileProcessor:
                             logging.info(
                                 f"Processing loop finished. Progress saved up to item {next_index_to_write - 1}.")
 
-
-        except KeyboardInterrupt:
-            logging.warning("--- INTERRUPTED BY USER ---")
-            logging.info(f"Progress saved up to item {next_index_to_write - 1}. Job will resume on next run.")
-            return  # Do not finalize
         except (IOError, Exception) as e:
+            # We still catch *other* errors to log progress
             logging.critical(f"An unexpected error occurred during processing: {e}")
             logging.info(f"Progress saved up to item {next_index_to_write - 1}. Job will resume.")
             return  # Do not finalize
