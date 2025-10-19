@@ -3,63 +3,132 @@ import logging
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import TYPE_CHECKING, Any, Dict, List, Tuple
+from statistics import mean
 
 if TYPE_CHECKING:
     from ai_translator.processing import FileProcessor
 
-TUNE_CHUNK_SIZE = 20  # Number of items to test for each worker count
-TUNE_IMPROVEMENT_THRESHOLD = 0.95  # Must be at least 5% faster to continue tuning
+# --- CONFIG ------------------------------------------------------------
+TUNE_MEASURE_DURATION = 30          # seconds per test round
+TUNE_IMPROVEMENT_THRESHOLD = 0.99   # require +1% improvement to continue
+TUNE_VALIDATION_REPEAT = True       # revalidate plateau worker to confirm
+# ----------------------------------------------------------------------
 
 
 class WorkerTuner:
-    """Finds the optimal number of workers for the current environment."""
+    """Finds the optimal number of workers for current hardware."""
 
     def __init__(self, processor: 'FileProcessor'):
-        # This uses a forward reference to avoid circular imports
         self.processor = processor
 
-    def _run_chunk(self, items: List[Tuple[int, Dict[str, Any]]], num_workers: int) -> float:
-        """Process a chunk of items with a given number of workers and return the duration."""
+    # ------------------------------------------------------------
+    # Internal helper: run one timed batch
+    # ------------------------------------------------------------
+    def _run_chunk(self, items: List[Tuple[int, Dict[str, Any]]], num_workers: int) -> Tuple[int, float]:
+        """Process as many items as possible in the defined measurement window."""
+        processed_count = 0
         start_time = time.monotonic()
+        cutoff_time = start_time + TUNE_MEASURE_DURATION
+
+        def timed_task(item_tuple):
+            nonlocal processed_count
+            if time.monotonic() > cutoff_time:
+                return
+            _, item, status = self.processor._process_single_item(item_tuple)
+            if status == "translated":
+                processed_count += 1
+
         with ThreadPoolExecutor(max_workers=num_workers) as executor:
-            # We only need to submit the work, results are handled by the main processor's method
-            futures = {executor.submit(self.processor._process_single_item, item) for item in items}
-            for future in as_completed(futures):
-                future.result()  # Wait for all to complete
-        return time.monotonic() - start_time
+            futures = {executor.submit(timed_task, item) for item in items}
+            for f in as_completed(futures):
+                if time.monotonic() > cutoff_time:
+                    break
+                f.result()
 
+        duration = time.monotonic() - start_time
+        items_per_min = (processed_count / duration) * 60 if duration > 0 else 0
+        return processed_count, items_per_min
+
+    # ------------------------------------------------------------
+    # ASCII table for results
+    # ------------------------------------------------------------
+    def _print_table(self, history: List[Dict[str, Any]]):
+        logging.info("")
+        logging.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        logging.info(f"{'Workers':>8} │ {'Items/min':>10} │ {'Δ vs prev':>10} │ {'Δ vs best':>10}")
+        logging.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        best = max(h["items_per_min"] for h in history)
+        for i, h in enumerate(history):
+            delta_prev = (
+                f"{(h['items_per_min'] / history[i-1]['items_per_min'] - 1) * 100:+.1f}%"
+                if i > 0 else "base"
+            )
+            delta_best = f"{(h['items_per_min'] / best - 1) * 100:+.1f}%"
+            logging.info(f"{h['workers']:>8} │ {h['items_per_min']:>10.1f} │ {delta_prev:>10} │ {delta_best:>10}")
+        logging.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
+    # ------------------------------------------------------------
+    # Main auto-tune entrypoint
+    # ------------------------------------------------------------
     def auto_tune(self, items_to_process: List[Tuple[int, Dict[str, Any]]]) -> int:
-        """Iteratively finds the best number of workers."""
-        logging.info("--- Starting worker auto-tuning ---")
+        logging.info("⚙️  --- Starting worker auto-tuning ---")
+        logging.info("🔥 Running warmup batch to stabilize model...")
+        warmup_items = items_to_process[:10]
+        self._run_chunk(warmup_items, 1)
+
+        worker_candidates = [1, 2, 4, 8, 12, 16, 24, 32, 48, 64, 96, 128, 256, 512]
+        history: List[Dict[str, Any]] = []
+
         best_workers = 1
+        best_items_per_min = 0
 
-        logging.info(f"Tuning: Testing with 1 worker...")
-        baseline_duration = self._run_chunk(items_to_process[:TUNE_CHUNK_SIZE], 1)
-        best_duration = baseline_duration
-        logging.info(f"Tuning: 1 worker took {baseline_duration:.2f}s for {TUNE_CHUNK_SIZE} items.")
+        for workers in worker_candidates:
+            processed, items_per_min = self._run_chunk(items_to_process, workers)
+            history.append({
+                "workers": workers,
+                "items_per_min": items_per_min,
+                "processed": processed,
+            })
 
-        current_workers = 2
-        while True:
-            # Ensure we have enough items left to conduct the next test run
-            start_index = (current_workers - 1) * TUNE_CHUNK_SIZE
-            end_index = current_workers * TUNE_CHUNK_SIZE
-            if end_index > len(items_to_process):
-                logging.warning("Not enough items left for further tuning.")
-                break
+            avg_last = mean([h["items_per_min"] for h in history[-2:]]) if len(history) > 1 else items_per_min
 
-            logging.info(f"Tuning: Testing with {current_workers} workers...")
-            items_for_this_run = items_to_process[start_index:end_index]
-            current_duration = self._run_chunk(items_for_this_run, current_workers)
-            logging.info(f"Tuning: {current_workers} workers took {current_duration:.2f}s for {TUNE_CHUNK_SIZE} items.")
+            logging.info("")
+            logging.info(f"⚙️  {workers} workers → {items_per_min:.1f} items/min ({processed} processed)")
+            logging.info(f"⚙️  Current average: {avg_last:.1f} items/min")
 
-            # If the new time is not significantly better, we stop
-            if current_duration >= best_duration * TUNE_IMPROVEMENT_THRESHOLD:
-                logging.info(f"Tuning: Performance plateaued or degraded. Optimal workers: {best_workers}")
-                break
+            # Improvement check
+            if items_per_min > best_items_per_min * TUNE_IMPROVEMENT_THRESHOLD:
+                best_items_per_min = max(best_items_per_min, items_per_min)
+                best_workers = workers
+            else:
+                # Plateau detected → optional validation
+                logging.info("")
+                logging.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+                logging.info("📉  Performance plateau detected — validating best worker again...")
+                logging.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
-            best_duration = current_duration
-            best_workers = current_workers
-            current_workers += 1
+                if TUNE_VALIDATION_REPEAT:
+                    _, recheck_speed = self._run_chunk(items_to_process, best_workers)
+                    if recheck_speed >= best_items_per_min * TUNE_IMPROVEMENT_THRESHOLD:
+                        logging.info("")
+                        logging.info("✅ Plateau confirmed after re-test. Stopping tuning.")
+                        logging.info("✅ Plateau confirmed after re-test. Stopping tuning.")
+                        logging.info("✅ Plateau confirmed after re-test. Stopping tuning.")
+                        break
+                    else:
+                        logging.info("🌀 Re-test showed better results, continuing search...")
+                        best_items_per_min = recheck_speed
+                        continue
+                else:
+                    break
 
-        logging.info(f"--- Auto-tuning complete. Using {best_workers} workers for the remainder. ---")
+        # Final table
+        self._print_table(history)
+
+        # Triple log for visibility
+        logging.info("")
+        logging.info(f"🏁🏁🏁  Optimal workers ≈ {best_workers} → {best_items_per_min:.1f} items/min 🚀🚀🚀")
+        logging.info(f"🏁🏁🏁  Optimal workers ≈ {best_workers} → {best_items_per_min:.1f} items/min 🚀🚀🚀")
+        logging.info(f"🏁🏁🏁  Optimal workers ≈ {best_workers} → {best_items_per_min:.1f} items/min 🚀🚀🚀")
+        logging.info("")
         return best_workers

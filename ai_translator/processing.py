@@ -27,6 +27,7 @@ class FileProcessor:
 
     def _process_single_item(self, item_tuple: Tuple[int, Dict[str, Any]]) -> Tuple[int, Optional[Dict[str, Any]]]:
         """Handles the logic for a single item: filtering, translation, and returning the result."""
+
         item_index, item = item_tuple
 
         available_langs = [k for k, v in item.items() if is_language_key(k) and v]
@@ -71,11 +72,15 @@ class FileProcessor:
         resume_index = read_progress(self.progress_path)
         items_to_process = list(enumerate(source_data))[resume_index:]
 
-        if not items_to_process:
-            logging.info("All source items evaluated. Finalizing.")
-            if finalize_and_cleanup(self.processing_path, self.args.done_dir):
-                if self.processing_path.exists():
-                    shutil.move(self.processing_path, self.args.done_dir)
+        if not items_to_process and resume_index > 0:
+            logging.info("All source items were already processed. Finalizing.")
+            # If we are resuming and have no items, we are done.
+            finalize_and_cleanup(self.processing_path, self.args.done_dir)
+            return
+        elif not items_to_process:
+            logging.info("Source file is empty. Moving to done.")
+            # Source file was empty to begin with
+            finalize_and_cleanup(self.processing_path, self.args.done_dir)
             return
 
         num_workers = self.args.workers
@@ -84,34 +89,79 @@ class FileProcessor:
             num_workers = tuner.auto_tune(items_to_process)
         else:
             logging.info(f"Using fixed number of workers: {num_workers}")
+            self.args.num_workers = num_workers
+
+        # --- NEW LOGIC: Immediate append with in-order buffer ---
+
+        # This is the next sequential index we must write to the file.
+        # It's initialized to the index we are resuming from.
+        next_index_to_write = resume_index
+
+        # Buffer for results that finish out of order
+        results_buffer: Dict[int, Optional[Dict[str, Any]]] = {}
+
+        processing_completed = False
 
         try:
             write_mode = "a" if resume_index > 0 else "w"
             with open(self.jsonl_path, write_mode, encoding="utf-8") as jsonl_file:
                 with ThreadPoolExecutor(max_workers=num_workers) as executor:
-                    futures = {executor.submit(self._process_single_item, item): item for item in items_to_process}
+
+                    futures = {
+                        executor.submit(self._process_single_item, item): item[0]
+                        for item in items_to_process
+                    }
 
                     progress_bar = tqdm(total=len(items_to_process), desc=f"Processing {self.processing_path.name}",
                                         unit=" items")
+
                     with progress_bar:
-                        results = {}
                         for future in as_completed(futures):
+                            # 1. A thread finished (out of order)
                             original_index, result_item = future.result()
-                            results[original_index] = result_item
+                            results_buffer[original_index] = result_item
                             progress_bar.update(1)
 
-                        logging.info("Writing results to .jsonl file in original order...")
-                        for i, item_tuple in enumerate(items_to_process):
-                            original_index = item_tuple[0]
-                            if original_index in results:
-                                result_item = results[original_index]
-                                if result_item:
-                                    jsonl_file.write(json.dumps(result_item) + "\n")
-                            write_progress(self.progress_path, original_index + 1)
+                            # 2. Try to flush the buffer *in order*
+                            # Check if the index we are waiting for is now in the buffer
+                            while next_index_to_write in results_buffer:
+                                # Get the item for the *correct* index
+                                buffered_item = results_buffer.pop(next_index_to_write)
+
+                                # A) Write item to .jsonl (if it wasn't skipped)
+                                if buffered_item:
+                                    jsonl_file.write(json.dumps(buffered_item, ensure_ascii=False) + "\n")
+
+                                # B) Update progress file to point to the *next* item
+                                write_progress(self.progress_path, next_index_to_write + 1)
+
+                                # C) Increment the pointer
+                                next_index_to_write += 1
+
+                        # Flush the file buffer to disk
                         jsonl_file.flush()
 
+                        # 3. Check if we finished the whole file
+                        if next_index_to_write == len(source_data):
+                            processing_completed = True
+                        else:
+                            logging.info(
+                                f"Processing loop finished. Progress saved up to item {next_index_to_write - 1}.")
+
+
+        except KeyboardInterrupt:
+            logging.warning("--- INTERRUPTED BY USER ---")
+            logging.info(f"Progress saved up to item {next_index_to_write - 1}. Job will resume on next run.")
+            return  # Do not finalize
         except (IOError, Exception) as e:
             logging.critical(f"An unexpected error occurred during processing: {e}")
-            return
+            logging.info(f"Progress saved up to item {next_index_to_write - 1}. Job will resume.")
+            return  # Do not finalize
 
-        finalize_and_cleanup(self.processing_path, self.args.done_dir)
+        # 4. Finalize
+        if processing_completed:
+            logging.info(f"All {len(source_data)} items processed.")
+            finalize_and_cleanup(self.processing_path, self.args.done_dir)
+        else:
+            logging.info(
+                f"Processing for {self.processing_path.name} was not fully completed. Files remain in 'processing'.")
