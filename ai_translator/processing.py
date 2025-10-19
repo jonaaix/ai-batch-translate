@@ -198,7 +198,9 @@ class FileProcessor:
                 logging.info(f"Auto-tune disabled. Using {num_workers} worker(s).")
         # --- End FIX ---
 
-        logging.info(f"Starting job with {num_workers} worker threads.")
+        logging.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        logging.info(f"🚀 Starting main job with {num_workers} worker threads. 🚀")
+        logging.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
         # This is the next sequential index we must write to the file.
         next_index_to_write = resume_index
