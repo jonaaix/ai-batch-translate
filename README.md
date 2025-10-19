@@ -49,15 +49,22 @@ A script to batch-translate JSON files using a local AI API.
 
 ## RunPod setup oneliner
 ```shell
-python -m venv venv && source venv/bin/activate && pip install -r requirements.txt
+pip install vllm hf_transfer transformers accelerate && \
+python -m vllm.entrypoints.openai.api_server \
+  --model Qwen/Qwen3-8B-AWQ \
+  --dtype auto \
+  --tensor-parallel-size 1 \
+  --max-model-len 32768 \
+  --max-num-seqs 128 \
+  --max-num-batched-tokens 12288 
 
-pkill -f ollama && \
-OLLAMA_HOST=0.0.0.0 \
-OLLAMA_KEEP_ALIVE=24h \
-OLLAMA_NUM_PARALLEL=2 \
-OLLAMA_MAX_LOADED_MODELS=1 \
-OLLAMA_FLASH_ATTENTION=0 \
-ollama serve &
+python -m venv venv && source venv/bin/activate && pip install -r requirements.txt && python run_translator.py
 
+AI_API_URL="http://localhost:8000/v1/chat/completions"
+AI_MODEL_NAME="Qwen/Qwen3-8B-AWQ" 
+```
+
+## Run without autotune
+```shell
 python run_translator.py --no-auto-tune --workers 16
 ```
