@@ -50,6 +50,7 @@ A script to batch-translate JSON files using a local AI API.
 
 ## RunPod setup oneliner
 ```shell
+# 1st terminal window
 pip install vllm hf_transfer transformers accelerate && \
 python -m vllm.entrypoints.openai.api_server \
   --model Qwen/Qwen3-8B-AWQ \
@@ -59,8 +60,11 @@ python -m vllm.entrypoints.openai.api_server \
   --max-num-seqs 128 \
   --max-num-batched-tokens 12288 
 
-python -m venv venv && source venv/bin/activate && pip install -r requirements.txt && python run_translator.py
+# 2nd terminal window (after the server is running)
+python -m venv venv && source venv/bin/activate && pip install -r requirements.txt
+python run_translator.py
 
+# .env file configuration
 AI_API_URL="http://localhost:8000/v1/chat/completions"
 AI_MODEL_NAME="Qwen/Qwen3-8B-AWQ" 
 ```
