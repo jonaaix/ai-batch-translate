@@ -6,6 +6,10 @@ import sys
 from pathlib import Path
 
 from colorlog import ColoredFormatter
+# --- FIX: Import the correct class name with a leading underscore ---
+from tqdm.contrib.logging import _TqdmLoggingHandler
+
+# --- End FIX ---
 
 # --- Constants ---
 DEFAULT_BATCH_SIZE: int = 100
@@ -32,7 +36,12 @@ def setup_logging(log_file: str = "processing.log") -> None:
         '%(log_color)s%(asctime)s [%(levelname)s] - %(message)s',
         log_colors=log_colors
     )
-    console_handler = logging.StreamHandler(sys.stdout)
+
+    # --- FIX: Use the correct imported class name ---
+    # This integrates logging with the tqdm progress bar to prevent deadlocks
+    console_handler = _TqdmLoggingHandler()
+    # --- End FIX ---
+
     console_handler.setLevel(logging.DEBUG)
     console_handler.setFormatter(console_formatter)
     root_logger.addHandler(console_handler)
@@ -41,10 +50,12 @@ def setup_logging(log_file: str = "processing.log") -> None:
 def parse_arguments() -> argparse.Namespace:
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(description="Batch translate JSON files.")
+
     parser.add_argument(
-        "--workers", type=int, default=4,
+        "--workers", type=int, default=1,
         help="Number of parallel worker threads."
     )
+
     # The auto-tune feature is now enabled by default.
     parser.add_argument(
         "--no-auto-tune", dest='auto_tune', action='store_false',

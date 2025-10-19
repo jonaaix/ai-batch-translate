@@ -11,6 +11,10 @@ from tqdm import tqdm
 
 from ai_translator.services.ai_api import call_ai_translation_api
 from ai_translator.state_manager import finalize_and_cleanup, read_progress, write_progress
+# --- FIX: Import Tuner ---
+from ai_translator.tuner import WorkerTuner
+
+# --- End FIX ---
 
 # Language priority for finding a source text
 SOURCE_LANG_PRIORITY = ["de", "en", "fr"]
@@ -47,12 +51,14 @@ class FileProcessor:
         missing = [k for k, v in lang_values.items() if not v]
 
         if not missing:
-            tqdm.write(f"Item #{item_index} is already fully translated.")
+            # --- FIX: Use logging, not tqdm.write ---
+            logging.info(f"Item #{item_index} is already fully translated.")
             return item
 
         source_info = self._get_source_language(item)
         if not source_info:
-            tqdm.write(f"[ERROR] Item #{item_index}: No valid source text found.")
+            # --- FIX: Use logging, not tqdm.write ---
+            logging.error(f"[ERROR] Item #{item_index}: No valid source text found.")
             return item
 
         source_lang, source_text = source_info
@@ -67,17 +73,57 @@ class FileProcessor:
             for lang_code, text in translations.items():
                 if lang_code in missing:
                     item[lang_code] = text
-            tqdm.write(f"Item #{item_index} successfully translated.")
+            # --- FIX: Use logging, not tqdm.write ---
+            logging.info(f"Item #{item_index} successfully translated.")
         else:
-            tqdm.write(f"[ERROR] Translation failed for item #{item_index}.")
+            # --- FIX: Use logging, not tqdm.write ---
+            logging.error(f"[ERROR] Translation failed for item #{item_index}.")
 
         return item
 
+    # --- FIX: Add compatibility shim for WorkerTuner ---
+    def _process_single_item(self, item_tuple: Tuple[int, Dict[str, Any]]) -> Tuple[int, Optional[Dict[str, Any]], str]:
+        """
+        DEPRECATED: Kept *only* for compatibility with the WorkerTuner.
+        Returns (index, item, status_string).
+        """
+        item_index, item = item_tuple
+
+        try:
+            available_langs = [k for k, v in item.items() if self._is_language_key(k) and v]
+            if len(available_langs) < 1:
+                # --- FIX: Use logging, not tqdm.write ---
+                logging.info(f"Item #{item_index} (tune) has 0 languages. Skipping.")
+                return item_index, None, "skipped"
+
+            lang_values = {k: v for k, v in item.items() if self._is_language_key(k)}
+            missing = [k for k, v in lang_values.items() if not v]
+            if not missing:
+                return item_index, item, "skipped"  # Already translated
+
+            source_info = self._get_source_language(item)
+            if not source_info:
+                return item_index, item, "skipped"  # No source
+
+            # Call the core translation logic
+            # Note: The tuner only cares about execution time, not batch_start_index
+            processed_item = self._translate_item(item, item_index, 0)
+
+            # This is good enough for a time-based test.
+            return item_index, processed_item, "translated"
+
+        except Exception as e:
+            # --- FIX: Use logging, not tqdm.write ---
+            logging.error(f"[CRITICAL_THREAD_ERROR] (Tune) Item #{item_index} failed: {e}")
+            return item_index, item, "failed"
+
+    # --- End FIX ---
+
     def _process_item_wrapper(
-        self,
-        item_index: int,
-        item: Dict[str, Any],
-        batch_start_index: int
+            self,
+            item_index: int,
+            item: Dict[str, Any],
+            batch_start_index: int
     ) -> Tuple[int, Optional[Dict[str, Any]]]:
         """
         Wraps the logic from the old single-threaded loop for use in a thread pool.
@@ -87,7 +133,8 @@ class FileProcessor:
             # This logic is from your working snapshot's run() loop
             available_langs = [k for k, v in item.items() if self._is_language_key(k) and v]
             if len(available_langs) < 1:
-                tqdm.write(f"Item #{item_index} has 0 languages. Skipping.")
+                # --- FIX: Use logging, not tqdm.write ---
+                logging.info(f"Item #{item_index} has 0 languages. Skipping.")
                 return item_index, None  # None indicates "skip"
 
             # This logic calls your working snapshot's translate function
@@ -96,8 +143,8 @@ class FileProcessor:
 
         except Exception as e:
             # Catch errors within the thread to avoid killing the whole pool
-            tqdm.write(f"[CRITICAL_THREAD_ERROR] Item #{item_index} failed: {e}")
-            logging.error(f"Error processing item #{item_index}: {e}", exc_info=True)
+            # --- FIX: Use logging, not tqdm.write ---
+            logging.error(f"[CRITICAL_THREAD_ERROR] Item #{item_index} failed: {e}", exc_info=True)
             # Return original item on failure, so progress can advance
             return item_index, item
 
@@ -121,8 +168,6 @@ class FileProcessor:
             finalize_and_cleanup(self.processing_path, self.args.done_dir)
             return
 
-        # --- NEW THREADED LOGIC ---
-
         # 1. Prepare items to process (from the resume_index onwards)
         items_to_process = []
         for i in range(resume_index, len(source_data)):
@@ -133,8 +178,26 @@ class FileProcessor:
             finalize_and_cleanup(self.processing_path, self.args.done_dir)
             return
 
-        # Get worker count from args (added to config.py)
-        num_workers = getattr(self.args, "workers", 1)  # Default to 1 if arg is missing
+        # --- FIX: Re-introduce Auto-Tuner logic ---
+        num_workers = self.args.workers  # Get fallback workers
+
+        # Check if auto-tune is enabled (it is by default, see config)
+        if self.args.auto_tune and len(items_to_process) > 40:  # Need enough items to tune
+            logging.info("Starting auto-tuner...")
+            try:
+                tuner = WorkerTuner(self)  # Requires _process_single_item
+                num_workers = tuner.auto_tune(items_to_process)
+            except ImportError:
+                logging.warning("Auto-tune failed: Could not import WorkerTuner. Falling back to default workers.")
+            except Exception as e:
+                logging.error(f"Auto-tune failed: {e}. Falling back to default workers.")
+        else:
+            if self.args.auto_tune:
+                logging.info(f"Skipping auto-tune (only {len(items_to_process)} items). Using {num_workers} worker(s).")
+            else:
+                logging.info(f"Auto-tune disabled. Using {num_workers} worker(s).")
+        # --- End FIX ---
+
         logging.info(f"Starting job with {num_workers} worker threads.")
 
         # This is the next sequential index we must write to the file.
@@ -151,16 +214,27 @@ class FileProcessor:
                 with ThreadPoolExecutor(max_workers=num_workers) as executor:
 
                     futures = {
+                        # Use the *main* wrapper, not the tuner's shim
                         executor.submit(self._process_item_wrapper, i, item, resume_index): i
                         for (i, item) in items_to_process
                     }
 
+                    # --- FIX: Correct tqdm bar formatting ---
+                    # Format: Description |Bar| Count [Speed]
+                    custom_bar_format = (
+                        "{l_bar} |{bar}| {n_fmt}/{total_fmt} [{rate_fmt}]"
+                    )
+
                     progress_bar = tqdm(
-                        initial=0,  # This bar tracks *completed* items
+                        initial=0,
                         total=len(items_to_process),
                         desc=f"Processing {self.processing_path.name}",
-                        unit=" items"
+                        unit=" items",
+                        ncols=150,  # Fixed width of 100 characters
+                        bar_format=custom_bar_format,
+                        ascii="░█"  # Use light shade (░) for empty, full block (█) for full
                     )
+                    # --- END FIX ---
 
                     with progress_bar:
                         for future in as_completed(futures):
